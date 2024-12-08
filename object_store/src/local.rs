@@ -162,8 +162,18 @@ pub(crate) enum Error {
         source: io::Error,
     },
 
+    #[snafu(display("Failed to read from file: {}", source))]
+    ReadFile {
+        source: io::Error,
+    },
+
     #[snafu(display("Failed to write to file: {}", source))]
     WriteFile {
+        source: io::Error,
+    },
+
+    #[snafu(display("Unable to access to metadata file: {}", source))]
+    MetadataFile {
         source: io::Error,
     },
 
@@ -1243,6 +1253,84 @@ pub async fn download(
         }
     }
     Ok(written_bytes)
+}
+
+/// Uploads a local file to the object store.
+///
+/// # Arguments
+/// - `store`: A reference-counted `ObjectStore` instance used for the upload.
+/// - `file`: A mutable reference to the local file to be uploaded.
+/// - `location`: The destination path in the object store where the file will be uploaded.
+/// - `transfer_opts`: Optional transfer configuration to manage concurrent uploads, memory usage, and part sizes.
+///
+/// # Details
+/// The function determines whether to perform a single PUT operation or a multipart upload
+/// based on the file size and the specified part size. Files smaller than 5 MB or smaller than
+/// the part size are uploaded in a single operation, while larger files are split into parts
+/// for concurrent uploads.
+///
+/// The multipart upload process uses a semaphore to manage concurrency. Each part is read
+/// into memory, uploaded to the object store, and tracked for completion. If any upload
+/// part fails, the entire multipart upload is aborted.
+///
+/// # Returns
+/// A `Result` containing the `PutResult` for the uploaded file or an error if the upload fails.
+///
+/// # Notes
+/// This function handles multipart uploads to efficiently upload large files using
+/// concurrent tasks. The `put_part` method ensures that each part is uploaded independently,
+/// and the process only completes once all parts are successfully uploaded and committed.
+pub async fn upload(
+    store: Arc<dyn ObjectStore>,
+    mut file: &std::fs::File,
+    location: &Path,
+    transfer_opts: Option<TransferOptions>,
+) -> Result<PutResult> {
+    let opts = transfer_opts.unwrap_or(TransferOptions::default());
+    let file_size = file.metadata().context(MetadataFileSnafu)?.len();
+    let part_size = opts.part_size;
+    if file_size < 5 * 1024 * 1024 || file_size < part_size as u64 {
+        let mut buffer = bytes::BytesMut::with_capacity(file_size as usize);
+        let _ = file.read(&mut buffer).context(ReadFileSnafu)?;
+        return store
+            .put(location, PutPayload::from_bytes(buffer.freeze()))
+            .await;
+    }
+
+    let concurrent_tasks = opts.concurrent_tasks;
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrent_tasks));
+    let mut offset = 0;
+    let mut upload = store.put_multipart(location).await?;
+    let mut tasks = tokio::task::JoinSet::new();
+
+    while offset < file_size {
+        let mut buffer = bytes::BytesMut::with_capacity(part_size);
+        let read = file.read(&mut buffer).context(ReadFileSnafu)?;
+        let permit = semaphore.clone().acquire_owned().await.unwrap();
+        let future = upload.put_part(PutPayload::from_bytes(buffer.freeze()));
+
+        offset += read as u64;
+        tasks.spawn(async move {
+            let _permit = permit;
+            future.await
+        });
+    }
+
+    while let Some(result) = tasks.join_next().await {
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                upload.abort().await?;
+                return Err(e);
+            }
+            Err(join_error) => {
+                upload.abort().await?;
+                return Err(join_error.into());
+            }
+        }
+    }
+    let result = upload.complete().await?;
+    Ok(result)
 }
 
 #[cfg(unix)]

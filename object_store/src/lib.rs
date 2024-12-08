@@ -1109,6 +1109,8 @@ pub struct TransferOptions {
     pub buffer_capacity: Option<usize>,
     /// Maximum number of retries for a chunk transfer.
     pub max_retries: Option<usize>,
+    /// Size the file will be split to be transfer in case of using upload
+    pub part_size: usize,
 }
 
 impl TransferOptions {
@@ -1117,13 +1119,16 @@ impl TransferOptions {
         concurrent_tasks: usize,
         buffer_capacity: Option<usize>,
         max_retries: Option<usize>,
+        part_size: Option<usize>,
     ) -> Self {
         let buffer_capacity = buffer_capacity.or(Some(concurrent_tasks));
         let max_retries = max_retries.or(Some(3));
+        let part_size = part_size.unwrap_or(10 * 1024 * 1024); // 10MB
         Self {
             concurrent_tasks,
             buffer_capacity,
             max_retries,
+            part_size,
         }
     }
 }
@@ -1135,10 +1140,10 @@ impl Default for TransferOptions {
             concurrent_tasks: 1,
             buffer_capacity: Some(1),
             max_retries: None,
+            part_size: 10 * 1024 * 1024, // 10MB
         }
     }
 }
-
 /// Configure preconditions for the put operation
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum PutMode {
